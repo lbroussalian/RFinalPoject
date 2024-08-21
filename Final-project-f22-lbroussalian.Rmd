@@ -1,0 +1,734 @@
+---
+title: 'Heavy Metal Concentrations at Abandoned Tungsten Mines'
+author: "Lilianna Broussalian"
+date: "2022-11-18"
+output: html_document
+bibliography: library.bib
+link-citations: TRUE
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r include=FALSE, message=FALSE, warning= FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# Packages/libraries needed:
+library(magrittr)
+library(dplyr)
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(huxtable)
+library(ggpubr)
+library(leaflet)
+library(leaflet.extras)
+library(broom)
+library(AICcmodavg)
+library(sf)
+library(leaflegend)
+library(bookdown)
+library(fontawesome)
+library(RColorBrewer)
+remotes::install_github("Lchiffon/leafletCN")
+library(leafletCN)
+library(ggrepel)
+library(mapview)
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+
+LabWeights_2022_0621 <- read_excel("RProj_LabWeights_2022_0621.xlsx")
+LabWeights_2022_0404 <- read_excel("RProj_LabWeights_2022_0404.xlsx")
+ICPMS_2022_0621 <- read_excel("RProj_ICPMS_2022_0621.xlsx")
+ICPMS_2022_0404 <- read_excel("RProj_ICPMS_2022_0404.xlsx")
+BPM_Sample_Coords <- read_excel("RProj_BPM_SampleCoordinates.xlsx")
+BPM_AllSampleLocations <- read_excel("BPM_SampleCoordinatesALL.xlsx")
+BM_AllSampleLocations <- read_excel("Boriana Mine Sample Coordinates Google Earth.xlsx")
+
+#Functions to tidy and clean data
+RawICP_Clean <- function(df){
+  names(df) <- paste(names(df), df[1, ], sep = "_")
+  df <- df[-1, 7:ncol(df)]
+  df_New <- df %>% 
+  dplyr::select(matches("Gas|Sample")) %>% 
+  dplyr::select(!contains("ISTD"))
+  
+  colnames(df_New) <- sub("\\[.*", "[ppb]", colnames(df_New))
+  colnames(df_New)[1] <- "Lab_ID"
+ 
+  df_New[,2:ncol(df_New)] <- lapply(df_New[,2:ncol(df_New)], as.numeric)
+  return(df_New)
+}
+WtCalcs <- function(df){
+  df_New <- df %>% 
+  mutate(
+    BulkSample_g = Sample_g - Empty1_g,
+    DigestedSample_g = RedissolvedSample_g - Empty2_g,
+    D1SampleAliquot_g = D1Sample_g - D1Empty_g,
+    QuadSample_g = D1Total_g - D1Empty_g
+  )
+  return(df_New)
+}
+BSCalc <- function(df){
+  df <- df %>% 
+  dplyr::select(c("Sample_ID","BulkSample_g":ncol(df)))
+  df_New <- df
+for (x in 6:ncol(df)){  
+ BulkConc <- (df$QuadSample_g / df$D1SampleAliquot_g) * (df$DigestedSample_g / df$BulkSample_g) * df[x]
+ df_New[x] <- BulkConc
+ 
+}
+  colnames(df_New) <- sub("\\[.*", "BulkSoil", colnames(df_New))
+  return(df_New)
+}
+
+#clean up the ICPMS file first with function that basically just extracts the concentration data from the ICP-MS raw data. 
+BPM_ICPMS_Data <- RawICP_Clean(ICPMS_2022_0621) %>% 
+ merge(RawICP_Clean(ICPMS_2022_0404), all.y = TRUE, all.x = TRUE)
+
+#cleans up/calculates some of the wts I need for the bulk soil concentrations
+BPM_Weights_Data <- WtCalcs(LabWeights_2022_0621) %>% 
+  merge(WtCalcs(LabWeights_2022_0404), all.y = TRUE, all.x = TRUE) %>% 
+  filter(!grepl('Blank|blank', Sample_ID)) 
+  
+#Join lab weights and conc data and calculate bulk soil conc.
+BPM_Lab_Data <- BPM_Weights_Data %>% 
+  left_join(BPM_ICPMS_Data, by = "Lab_ID") %>% 
+  dplyr::select(-"Lab_ID")
+
+BPM_BulkSoil_Data <- BSCalc(BPM_Lab_Data) %>% 
+  dplyr::select(matches("Bulksoil")) %>% 
+  cbind(BPM_Lab_Data[1]) %>% 
+  relocate(Sample_ID, .before = `55  Mn  BulkSoil`)
+colnames(BPM_BulkSoil_Data) <- c("SampleID", "Mn55_ppb", "Cu65_ppb", "Zn66_ppb",  "Mo95_ppb", "W182_ppb", "Pb208_ppb", "U238_ppb", "Fe56_ppb",  "Mo97_ppb", "Al27_ppb", "Ni60_ppb", "Ag107_ppb", "Cd111_ppb")
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+#Arrange data for analysis
+BulkSoilAnalysis <- BPM_BulkSoil_Data %>% 
+  dplyr::select(-(Mo97_ppb)) %>% 
+  dplyr::select(1:9) %>% 
+  relocate(W182_ppb, .before= Mn55_ppb) %>% 
+  relocate(Fe56_ppb, .before= Mn55_ppb)
+
+BulkSoilAnalysis <- cbind(BulkSoilAnalysis[1], ((BulkSoilAnalysis[-1])/1000))
+colnames(BulkSoilAnalysis) <- sub("\\_.*", "_ppm", colnames(BulkSoilAnalysis))
+BulkSoilAnalysis[BulkSoilAnalysis < 0] <- 0 
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+
+#What metals correlate with W
+WData <- BulkSoilAnalysis %>%
+  pivot_longer(-c(W182_ppm, SampleID), names_to= "Analyte", values_to = "concentration")
+
+WPlot <- WData %>%
+  ggplot(aes(x= W182_ppm, y= concentration))+
+  geom_point()+
+  geom_smooth(formula= "y ~ x", method= "lm", se= FALSE, color= "red", linewidth= 0.5)+
+  stat_regline_equation(aes(label = after_stat(rr.label)), label.y.npc = "top", label.x.npc= "center")+
+  facet_wrap(~Analyte, scales = "free")+
+  theme(legend.position = "top")+
+  labs(title = "W Correlation to Other Heavy Metals at BPM",
+         y= "Heavy Metal Soil Concentrations [ppm]",
+         x= "W Soil Concentrations [ppm]")+
+  theme_bw()
+
+WPlot  
+
+#What metals correlate with Fe
+FeData <- BulkSoilAnalysis %>%
+  pivot_longer(-c(Fe56_ppm, SampleID), names_to= "Analyte", values_to = "concentration")
+
+FePlot <- FeData %>%
+  ggplot(aes(x= Fe56_ppm, y= concentration))+
+  geom_point()+
+  facet_wrap(~Analyte, scales = "free")+
+  geom_smooth(formula= "y ~ x", method= "lm", se= FALSE, color= "red", linewidth= 0.5)+
+  stat_regline_equation(aes(label = after_stat(rr.label)), label.y.npc = "middle", label.x.npc= "center")+
+  labs(title = "Iron Control on Heavy Metals",
+         y= "Heavy Metal Soil Concentrations [ppm]",
+         x= "Fe Soil Concentrations [ppm]")+
+  theme_bw()+
+  theme(legend.position = "top")
+
+FePlot
+
+#What metals correlate with Mn
+MnData <- BulkSoilAnalysis %>%
+  pivot_longer(-c(Mn55_ppm, SampleID), names_to= "Analyte", values_to = "concentration")
+
+MnPlot <- MnData %>%
+  ggplot(aes(x= Mn55_ppm, y= concentration))+
+  geom_point()+
+  geom_smooth(formula= "y ~ x", method= "lm", se= FALSE, color= "red", linewidth= 0.5)+
+  stat_regline_equation(aes(label = after_stat(rr.label)), label.y.npc = "middle", label.x.npc= "center")+
+  facet_wrap(~Analyte, scales = "free")+
+  labs(title = "Manganese Control on Heavy Metals",
+         y= "Heavy Metal Soil Concentrations [ppm]",
+         x= "Mn Soil Concentrations [ppm]")+
+  theme_bw()+
+  theme(legend.position = "top")
+
+MnPlot
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+#Basic Visualization of Data on Map
+SampleLocations <- BPM_Sample_Coords %>% 
+  dplyr::select(1:3)
+  colnames(SampleLocations)[3] <- "SampleID"
+ConcMapData <- SampleLocations %>% 
+  right_join(BulkSoilAnalysis, by= "SampleID") %>% 
+  slice(-c(46:49)) %>% 
+  relocate(SampleID, .before = Latitude)
+
+
+#Use leaflet to spatially visualize heavy metal concentrations at Black Pearl Mine
+BPM_BaseMap <- leaflet() %>% 
+  addTiles() %>% 
+  setView(lat= 34.693024, lng= -113.041391, zoom= 14.5) %>% 
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+#Basic W concentration map
+Wpal <- colorNumeric(palette = ("YlOrBr"), domain = ConcMapData$W182_ppm)
+
+WBaseMap <- leaflet(ConcMapData) %>% 
+  addTiles() %>% 
+  setView(lat= 34.693024, lng= -113.041391, zoom= 14.5) %>% 
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+WConcMap <- WBaseMap %>%
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Wpal(W182_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "W(ppm):", round(ConcMapData$W182_ppm, 4)) %>% lapply(htmltools::HTML)) %>% 
+ addLegendNumeric(pal= Wpal, values= ~W182_ppm, decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", title= "[W]ppm Soil")
+  # addTitle("Black Pearl Mine: W Concentrations in Soil", color= "white", fontSize= "25px", leftPosition= 75, topPosition= 1)
+
+
+#All heavy metal concentration maps as layers
+ConcBaseMap <- leaflet(ConcMapData) %>% 
+  addTiles() %>% 
+  setView(lat= 34.693024, lng= -113.041391, zoom= 14.5) %>% 
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+Cupal <- colorNumeric(palette = ("OrRd"), domain = ConcMapData$Cu65_ppm)
+Znpal <- colorNumeric(palette = ("GnBu"), domain = ConcMapData$Zn66_ppm)
+Mopal <- colorNumeric(palette = ("RdPu"), domain = ConcMapData$Mo95_ppm)
+Pbpal <- colorNumeric(palette = ("PuBu"), domain = ConcMapData$Pb208_ppm)
+Upal <- colorNumeric(palette = ("YlGn"), domain = ConcMapData$U238_ppm)
+Fepal <- colorNumeric(palette = ("Oranges"), domain = ConcMapData$Fe56_ppm)
+Mnpal <- colorNumeric(palette = ("Reds"), domain = ConcMapData$Mn55_ppm)
+
+BPM_HeavyMetalMap <- ConcBaseMap %>% 
+  #W
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Wpal(W182_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "W(ppm):", round(ConcMapData$W182_ppm, 4)) %>% lapply(htmltools::HTML), group= "W") %>% 
+ addLegendNumeric(pal= Wpal, values= ~W182_ppm, decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", title= "[W]ppm Soil", group= "W") %>% 
+  #Cu
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Cupal(Cu65_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "Cu(ppm):", round(ConcMapData$Cu65_ppm, 4)) %>% lapply(htmltools::HTML), group= "Cu") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Cupal, values= ~Cu65_ppm, title= "[Cu]ppm Soil", group= "Cu") %>%  
+  #Zn
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Znpal(Zn66_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "Zn(ppm):", round(ConcMapData$Zn66_ppm, 4)) %>% lapply(htmltools::HTML), group= "Zn") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Znpal, values= ~Zn66_ppm, title= "[Zn]ppm Soil", group= "Zn") %>%
+  #Mo
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Mopal(Mo95_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "Mo(ppm):", round(ConcMapData$Mo95_ppm, 4)) %>% lapply(htmltools::HTML), group= "Mo") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Mopal, values= ~Mo95_ppm, title= "[Mo]ppm Soil", group= "Mo") %>%
+ #Pb
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Pbpal(Pb208_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "Pb(ppm):", round(ConcMapData$Pb208_ppm, 4)) %>% lapply(htmltools::HTML), group= "Pb") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Pbpal, values= ~Pb208_ppm, title= "[Pb]ppm Soil", group= "Pb") %>%
+  #U
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Upal(U238_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "U(ppm):", round(ConcMapData$U238_ppm, 4)) %>% lapply(htmltools::HTML), group= "U") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Upal, values= ~U238_ppm, title= "[U]ppm Soil", group= "U") %>%
+  #Fe
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Fepal(Fe56_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "Fe(ppm):", round(ConcMapData$Fe56_ppm, 4)) %>% lapply(htmltools::HTML), group= "Fe") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Fepal, values= ~Fe56_ppm, title= "[Fe]ppm Soil", group= "Fe") %>%
+  #Mn
+ addCircles(lng= ~Longitude, lat= ~Latitude, radius= 25, color= ~Mnpal(Mn55_ppm), fillOpacity = 0.75, weight= 1, label= paste(ConcMapData$SampleID, "<br/>", "Mn(ppm):", round(ConcMapData$Mn55_ppm, 4)) %>% lapply(htmltools::HTML), group= "Mn") %>% 
+ addLegendNumeric(decreasing= FALSE, width= 120, height= 20, position= "bottomright", orientation= "horizontal", pal= Mnpal, values= ~Mn55_ppm, title= "[Mn]ppm Soil", group= "Mn") %>% 
+  
+addLayersControl(baseGroups= c("Satellite", "Topo"), position = "topleft", 
+                 overlayGroups= c("W", "Mo", "Cu", "Zn","Pb", "U", "Fe", "Mn"), options= layersControlOptions(collapsed= TRUE)) %>% 
+  hideGroup(c("Mo", "Cu", "Zn","Pb", "U", "Fe", "Mn"))
+  # addTitle("Black Pearl Mine: Heavy Metal Soil Concentrations", color= "white", fontSize= "25px", leftPosition= 75, topPosition= 1)
+  
+BPM_HeavyMetalMap
+
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+
+#Heavy metal relationships with Fe and Mn looking at ratios of metals vs Fe and Mn
+FeMetalData <- ConcMapData %>%
+  na.omit() %>% 
+  mutate(
+    W_Fe= W182_ppm/Fe56_ppm*1000,
+    Mo_Fe= Mo95_ppm/Fe56_ppm*1000,
+    Zn_Fe= Zn66_ppm/Fe56_ppm*1000,
+    Cu_Fe= Cu65_ppm/Fe56_ppm*1000,
+    Pb_Fe= Pb208_ppm/Fe56_ppm*1000,
+    U_Fe= U238_ppm/Fe56_ppm*1000)
+
+#Map relationships above
+FeRatioBaseMap <- leaflet(FeMetalData) %>% 
+  addTiles() %>% 
+  setView(lat= 34.693024, lng= -113.041391, zoom= 14.5) %>% 
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+WsymFe <- makeSymbolsSize(values= FeMetalData$W_Fe, shape= "circle", color= "tomato", fillColor = "tomato", opacity= 0.5, baseSize = 10)
+CusymFe <- makeSymbolsSize(values= FeMetalData$Cu_Fe, shape= "circle", color= "salmon", fillColor = "salmon", opacity= 0.5, baseSize = 10)
+MosymFe <- makeSymbolsSize(values= FeMetalData$Mo_Fe, shape= "circle", color= "purple", fillColor = "purple", opacity= 0.5, baseSize = 10)
+ZnsymFe <- makeSymbolsSize(values= FeMetalData$Zn_Fe, shape= "circle", color= "dodgerblue", fillColor = "dodgerblue", opacity= 0.5, baseSize = 10)
+PbsymFe <- makeSymbolsSize(values= FeMetalData$Pb_Fe, shape= "circle", color= "azure", fillColor = "azure", opacity= 0.5, baseSize = 10)
+UsymFe <- makeSymbolsSize(values= FeMetalData$U_Fe, shape= "circle", color= "yellowgreen", fillColor = "yellowgreen", opacity= 0.5, baseSize = 10)
+
+BPM_FeMetalRatioMap <- FeRatioBaseMap %>% 
+  #W
+ addMarkers(icon= WsymFe, lng= ~Longitude, lat= ~Latitude, label= paste(FeMetalData$SampleID, "<br/>", "W/Fe:", round(FeMetalData$W_Fe, 4)) %>% lapply(htmltools::HTML), group= "W/Fe") %>% 
+ addLegendSize(values= ~W_Fe, baseSize = 8, shape= "circle", color= "tomato", fillColor= "tomato", opacity = 0.7, breaks= 6, position= "topright", orientation= "horizontal", title= "W/Fe Soil", group= "W/Fe") %>% 
+  #Cu
+ addMarkers(icon= CusymFe, lng= ~Longitude, lat= ~Latitude, label= paste(FeMetalData$SampleID, "<br/>", "Cu/Fe:", round(FeMetalData$Cu_Fe, 4)) %>% lapply(htmltools::HTML), group= "Cu/Fe") %>% 
+ addLegendSize(values= ~Cu_Fe, baseSize = 8, shape= "circle", color= "salmon", fillColor= "salmon", opacity = 0.7, breaks= 6, position= "topright", orientation= "horizontal", title= "Cu/Fe Soil", group= "Cu/Fe") %>% 
+  #Zn
+ addMarkers(icon= ZnsymFe, lng= ~Longitude, lat= ~Latitude, label= paste(FeMetalData$SampleID, "<br/>", "Zn/Fe:", round(FeMetalData$Zn_Fe, 4)) %>% lapply(htmltools::HTML), group= "Zn/Fe") %>% 
+ addLegendSize(values= ~Zn_Fe, baseSize = 8, shape= "circle", color= "dodgerblue", fillColor= "dodgerblue", opacity = 0.7, breaks= 6, position= "topright", orientation= "horizontal", title= "Zn/Fe Soil", group= "Zn/Fe") %>%  
+  #Mo
+ addMarkers(icon= MosymFe, lng= ~Longitude, lat= ~Latitude, label= paste(FeMetalData$SampleID, "<br/>", "Mo/Fe:", round(FeMetalData$Mo_Fe, 4)) %>% lapply(htmltools::HTML), group= "Mo/Fe") %>% 
+ addLegendSize(values= ~Mo_Fe, baseSize = 8, shape= "circle", color= "purple", fillColor= "purple", opacity = 0.7, breaks= 6, position= "topright", orientation= "horizontal", title= "Mo/Fe Soil", group= "Mo/Fe") %>%
+ #Pb
+ addMarkers(icon= PbsymFe, lng= ~Longitude, lat= ~Latitude, label= paste(FeMetalData$SampleID, "<br/>", "Pb/Fe:", round(FeMetalData$Pb_Fe, 4)) %>% lapply(htmltools::HTML), group= "Pb/Fe") %>% 
+ addLegendSize(values= ~Pb_Fe, baseSize = 8, shape= "circle", color= "azure", fillColor= "azure", opacity = 0.7, breaks= 6, position= "topright", orientation= "horizontal", title= "Pb/Fe Soil", group= "Pb/Fe") %>%
+  #U
+ addMarkers(icon= UsymFe, lng= ~Longitude, lat= ~Latitude, label= paste(FeMetalData$SampleID, "<br/>", "U/Fe:", round(FeMetalData$U_Fe, 4)) %>% lapply(htmltools::HTML), group= "U/Fe") %>% 
+ addLegendSize(values= ~U_Fe, baseSize = 8, shape= "circle", color= "yellowgreen", fillColor= "yellowgreen", opacity = 0.7, breaks= 6, position= "topright", orientation= "horizontal", title= "U/Fe Soil", group= "U/Fe") %>%
+
+addLayersControl(baseGroups= c("Satellite", "Topo"), position = "topleft", 
+                 overlayGroups= c("W/Fe", "Mo/Fe", "Cu/Fe", "Zn/Fe","Pb/Fe", "U/Fe"), options= layersControlOptions(collapsed= TRUE)) %>% 
+  hideGroup(c("Mo/Fe", "Cu/Fe", "Zn/Fe","Pb/Fe", "U/Fe")) 
+  # addTitle("Black Pearl Mine: Heavy Metals and Fe Ratios in Soil", color= "white", fontSize= "25px", leftPosition= 40, topPosition= 1)
+  
+BPM_FeMetalRatioMap
+
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+#Heavy metals and Mn ratios
+MnMetalData <- ConcMapData %>% 
+  mutate(
+    W_Mn= W182_ppm/Mn55_ppm,
+    Mo_Mn= Mo95_ppm/Mn55_ppm,
+    Zn_Mn= Zn66_ppm/Mn55_ppm,
+    Cu_Mn= Cu65_ppm/Mn55_ppm,
+    Pb_Mn= Pb208_ppm/Mn55_ppm,
+    U_Mn= U238_ppm/Mn55_ppm)
+
+#Map Mn data
+MnRatioBaseMap <- leaflet(MnMetalData) %>% 
+  addTiles() %>% 
+  setView(lat= 34.693024, lng= -113.041391, zoom= 14.5) %>% 
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+WsymMn <- makeSymbolsSize(values= MnMetalData$W_Mn, shape= "circle", color= "orangered", fillColor = "orangered", opacity= 0.5, baseSize = 4)
+CusymMn <- makeSymbolsSize(values= MnMetalData$Cu_Mn, shape= "circle", color= "chocolate", fillColor = "chocolate", opacity= 0.5, baseSize = 4)
+MosymMn <- makeSymbolsSize(values= MnMetalData$Mo_Mn, shape= "circle", color= "purple", fillColor = "purple", opacity= 0.5, baseSize = 4)
+ZnsymMn <- makeSymbolsSize(values= MnMetalData$Zn_Mn, shape= "circle", color= "dodgerblue", fillColor = "dodgerblue", opacity= 0.5, baseSize = 4)
+PbsymMn <- makeSymbolsSize(values= MnMetalData$Pb_Mn, shape= "circle", color= "azure", fillColor = "azure", opacity= 0.5, baseSize = 4)
+UsymMn <- makeSymbolsSize(values= MnMetalData$U_Mn, shape= "circle", color= "yellowgreen", fillColor = "yellowgreen", opacity= 0.5, baseSize = 4)
+
+BPM_MnMetalRatioMap <- MnRatioBaseMap %>% 
+  #W
+ addMarkers(icon= WsymMn, lng= ~Longitude, lat= ~Latitude, label= paste(MnMetalData$SampleID, "<br/>", "W/Mn:", round(MnMetalData$W_Mn, 4)) %>% lapply(htmltools::HTML), group= "W/Mn") %>% 
+ addLegendSize(values= ~W_Mn, baseSize = 2, shape= "circle", color= "orangered", fillColor= "orangered", opacity = 0.7, breaks= 4, position= "topright", orientation= "horizontal", title= "W/Mn Soil", group= "W/Mn") %>% 
+  #Cu
+ addMarkers(icon= CusymMn, lng= ~Longitude, lat= ~Latitude, label= paste(MnMetalData$SampleID, "<br/>", "Cu/Mn:", round(MnMetalData$Cu_Mn, 4)) %>% lapply(htmltools::HTML), group= "Cu/Mn") %>% 
+ addLegendSize(values= ~Cu_Mn, baseSize = 2, shape= "circle", color= "chocolate", fillColor= "chocolate", opacity = 0.7, breaks= 4, position= "topright", orientation= "horizontal", title= "Cu/Mn Soil", group= "Cu/Mn") %>% 
+  #Zn
+ addMarkers(icon= ZnsymMn, lng= ~Longitude, lat= ~Latitude, label= paste(MnMetalData$SampleID, "<br/>", "Zn/Mn:", round(MnMetalData$Zn_Mn, 4)) %>% lapply(htmltools::HTML), group= "Zn/Mn") %>% 
+ addLegendSize(values= ~Zn_Mn, baseSize = 2, shape= "circle", color= "dodgerblue", fillColor= "dodgerblue", opacity = 0.7, breaks= 4, position= "topright", orientation= "horizontal", title= "Zn/Mn Soil", group= "Zn/Mn") %>%  
+  #Mo
+ addMarkers(icon= MosymMn, lng= ~Longitude, lat= ~Latitude, label= paste(MnMetalData$SampleID, "<br/>", "Mo/Mn:", round(MnMetalData$Mo_Mn, 4)) %>% lapply(htmltools::HTML), group= "Mo/Mn") %>% 
+ addLegendSize(values= ~Mo_Mn, baseSize = 2, shape= "circle", color= "purple", fillColor= "purple", opacity = 0.7, breaks= 4, position= "topright", orientation= "horizontal", title= "Mo/Mn Soil", group= "Mo/Mn") %>%
+ #Pb
+ addMarkers(icon= PbsymMn, lng= ~Longitude, lat= ~Latitude, label= paste(MnMetalData$SampleID, "<br/>", "Pb/Mn:", round(MnMetalData$Pb_Mn, 4)) %>% lapply(htmltools::HTML), group= "Pb/Mn") %>% 
+ addLegendSize(values= ~Pb_Mn, baseSize = 2, shape= "circle", color= "azure", fillColor= "azure", opacity = 0.7, breaks= 4, position= "topright", orientation= "horizontal", title= "Pb/Mn Soil", group= "Pb/Mn") %>%
+  #U
+ addMarkers(icon= UsymMn, lng= ~Longitude, lat= ~Latitude, label= paste(MnMetalData$SampleID, "<br/>", "U/Mn:", round(MnMetalData$U_Mn, 4)) %>% lapply(htmltools::HTML), group= "U/Mn") %>% 
+ addLegendSize(values= ~U_Mn, baseSize = 2, shape= "circle", color= "yellowgreen", fillColor= "yellowgreen", opacity = 0.7, breaks= 4, position= "topright", orientation= "horizontal", title= "U/Mn Soil", group= "U/Mn") %>%
+
+addLayersControl(baseGroups= c("Satellite", "Topo"), position = "topleft", 
+                 overlayGroups= c("W/Mn", "Mo/Mn", "Cu/Mn", "Zn/Mn","Pb/Mn", "U/Mn"), options= layersControlOptions(collapsed= TRUE)) %>% 
+  hideGroup(c("Mo/Mn", "Cu/Mn", "Zn/Mn","Pb/Mn", "U/Mn"))
+  # addTitle("Black Pearl Mine: Heavy Metals and Mn Ratios in Soil", color= "white", fontSize= "25px", leftPosition= 40, topPosition= 1)
+  
+BPM_MnMetalRatioMap
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+#Subset data to use for PCA analysis
+princAnaly <- BulkSoilAnalysis %>% 
+  na.omit()
+princAnaly <- scale(princAnaly[-1], center= TRUE, scale= TRUE)
+
+#covariance and PC analysis
+SoilPCA <- prcomp(princAnaly, scale.= FALSE)
+
+sd <- SoilPCA$sdev
+loadings <- SoilPCA$rotation
+
+scores <- SoilPCA$x
+
+var <- sd^2
+varPercent <- var/sum(var) * 100
+dev.new()
+
+
+BarplotPCA <- barplot(varPercent, xlab= "PC", ylab= "Percent Variance",
+        names.arg= 1:length(varPercent), las=1, ylim= c(0, max(varPercent)))+
+        abline(h=1/ncol(princAnaly[-1])*100, col= "red")
+
+#cutoff = "important" loadings
+cutoff <- sqrt(1/ncol(princAnaly))
+
+varPercent[1:3]
+sum(varPercent[1:3])
+
+#Biplot from package
+dev.new(height=7, width=7)
+biplot(scores[, 1:2], loadings[, 1:2], cex= 0.7)
+
+#using ggplot with stats packages PCs
+arrowScale <- 8
+PCAPlot <- ggplot(as.data.frame(scores), aes(PC1, PC2))+ 
+  theme_classic()+
+  geom_point(size = 1.5)+                                              
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +                               
+  coord_fixed(xlim=c(-6,5),ylim=c(-5,6))+                                          
+  geom_segment(data = as.data.frame(loadings), aes(x= 0,y= 0, xend = PC1*arrowScale, yend = PC2*arrowScale), color= "red")+  
+  geom_label_repel(data= as.data.frame(loadings), aes(x = PC1*arrowScale*1.01, y = PC2*arrowScale*1.02, label = rownames(loadings)), size= 2.5, label.padding = unit(0.2, "lines"))+
+  labs(title = "PCA on Heavy Metals at BPM")+
+  theme_bw()+
+  theme(legend.position = "top")
+  
+PCAPlot
+
+```
+
+```{r include= FALSE, message= FALSE, warning= FALSE}
+#General Sample Location Maps
+BPM_AllSampleLocations <- BPM_AllSampleLocations %>% 
+  dplyr::select(1:3)
+colnames(BPM_AllSampleLocations)[3] <- "SampleID"
+
+BPM_SampleBaseMap <- leaflet(BPM_AllSampleLocations) %>% 
+  addTiles() %>% 
+  setView(lat= 34.693024, lng= -113.041391, zoom= 14.5) %>% 
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+BPM_SampleMap <- BPM_SampleBaseMap %>% 
+  addMarkers(lng= ~Longitude, lat= ~Latitude, label= ~SampleID) %>% 
+  addMiniMap()
+
+BM_AllSampleLocations <- BM_AllSampleLocations %>% 
+  dplyr::select(1:3)
+colnames(BM_AllSampleLocations)[3] <- "SampleID"
+
+BM_BaseMap <- leaflet() %>% 
+  addTiles() %>% 
+  setView(lat= 34.936391, lng= -113.919017, zoom= 15.1) %>%
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+BM_SampleBaseMap <- leaflet(BM_AllSampleLocations) %>% 
+  addTiles() %>% 
+  setView(lat= 34.936391, lng= -113.919017, zoom= 15.1) %>%
+  addProviderTiles("Esri.WorldImagery", group= "Satellite") %>% 
+  addProviderTiles("Esri.WorldTopoMap", group= "Topo") %>% 
+  addLayersControl(baseGroups = c("Satellite", "Topo"), position = "topleft")
+
+BM_SampleMap <- BM_SampleBaseMap %>%
+  addMarkers(lng= ~Longitude, lat= ~Latitude, label= ~SampleID) %>% 
+  addMiniMap()
+
+```
+
+## Project Motivation
+
+Tungsten (W) became a new emerging contaminant of concern for the United
+States (U.S.) Environmental Protection Agency (EPA) in 2002 after
+multiple studies correlated elevated tungsten concentrations with
+adverse health effects and environmental risks[@EPA2014]. Three
+childhood leukemia clusters appeared between 1997 and 2003 in Fallon,
+NV, Sierra Vista, AZ, and Grove, CA, prompting extensive testing and
+exposure assessments of environmental contaminants in drinking and
+surface water, surface soils, residential indoor dust, and air
+[@Rubin2007; @Sheppard2003; @Sheppard2012; @Dermatas2006; @Larson2009;
+@Strigul2010; @Strigul2005; @Koutsospyros2006; @Tuna2012]. Biological
+testing done by the Center for Disease Control (CDC) reported high
+levels of tungsten in urine (as high as 15 times the national average)
+from residents near Fallon, NV [@CDC2003], as well as high tungsten
+concentrations in trees from all three communities [@Sheppard2003]. All
+three towns are located near anthropogenic sources of tungsten including
+active or inactive tungsten mines, processing operations, and/or
+military bases. These events prompted the National Center for
+Environmental Health (NCEH) and CDC to designate tungsten for further
+study under the National Toxicity Program [@ATSDR2005]. While the events
+in Fallon, NV and Sierra Vista, AZ brought awareness to the threat of
+tungsten toxicity, to date there are no drinking water standards or
+regulations for the discharge of tungsten into the air, surface water,
+groundwater, or soils in the United States [@EPA2021].
+
+The market for tungsten has developed quickly since its official
+discovery in 1783 and tungsten is now recognized as one of 50 minerals
+deemed "critical to U.S national security and the economy" by the Energy
+Act of 2020 [@Nassar2021]. Tungsten ore is used to produce tungsten
+alloys and tungsten carbide which have a wide range of applications
+including welding, high-temperature cutting/drilling technologies,
+aerospace industries, filaments in light bulbs, and in manufacturing of
+electrodes and components used in touchscreen products [@EPA2014;
+@U.S.GeologicalSurvey2021; @Kabata-Pendias2007]. While tungsten has been
+used in munitions since the Second World War, production ramped up in
+the mid-1990s following a military initiative to go "green" by
+substituting toxic lead and radioactive uranium with an "environmentally
+friendly" alternative thought to be tungsten [@EPA2014], [@Clausen2011],
+[@Clausen2007], [@Dermatas2006], [@Bostick2018], [@Koutsospyros2006].
+China is currently the world's largest producer of tungsten controlling
+more than 80% of the world's supply but has effectively discontinued
+their exports in recent years, prompting tungsten to be moved to the top
+of the "endangered list" due to the limited supply [@BGS2016]. There
+have been no active U.S commercial tungsten mines in operation since
+2015 [@USGS], however in 1955, the U.S. boasted more than 740 operating
+tungsten mines [@Shedd2002] and according to USGS scientist Jeff Mauk,
+"the United States may have future production potential from U.S.
+projects that are currently in the advanced exploration
+stage,"[@Burton2021] . The economic importance of tungsten and the
+growing concern about limited supply gives an urgency to the research on
+the environmental fate and transport of tungsten. High concentrations of
+W have the potential to flow and seep into natural waters and soils from
+these legacy tungsten mines as well as future tungsten mines.
+Identifying the controls on tungsten mobility at these abandoned mines
+is a vital first step towards mitigation.
+
+The purpose of this study is to identify if adsorption is the main
+control on W contamination mobility in surficial soils and surface water
+from exposed tailings and waste piles at the Boriana and Black Pearl
+abandoned tungsten mines, in western, Arizona. To determine whether
+adsorption is the main control on W mobility, we must identify controls
+on tungsten adsorption in this field setting. The ultimate goal of this
+research is to provide a framework we can build upon to predict and
+prevent the mobilization of tungsten contamination from anthropogenic
+sources in the environment.
+
+## Fate and Transport of Tungsten
+
+The previous and long held notion that tungsten is immobile and
+environmentally "green" [@Kerwien1996; @Koutsospyros2006] is not
+supported by current research. Studies conducted at small arms firing
+ranges that utilized "green" ammunition found tungsten contamination in
+groundwater, subsurface and surficial soil, and plants @Clausen2007;
+@Clausen2011; @Bednar2006; @Bednar2009; @Bostick2018; @Seiler2005;
+@Tuna2012; @Datta2017; @Johannesson2013. Elevated tungsten levels
+attributed to nearby active mining operations have been found in soils,
+the crops grown in the contaminated soils in rice fields in China
+[@Silvetti2014; @Lin2014; @Wilson2006; @Wilson2009], as well as in soils
+and plants near inactive mining operations in southwestern France and
+northwest England.
+
+Elevated tungsten levels observed in anthropogenically contaminated
+surficial soils occur as two major aqueous species: metallic tungsten
+W(0) and oxide species W(VI) [@Bostick2018; @Clausen2009a; @Seiler2005;
+@Strigul2005; @Tuna2012a; @Hobson2020]. Bostick et al. (2018) reports
+that 98% of tungsten in contaminated soils from a munitions firing range
+is present as W(VI) after only a few years of exposure to the elements.
+This rapid environmental oxidation of metallic W(0) to highly soluble
+W(VI) species suggests W(VI) is the redox state of interest when
+considering transport and fate [@Hobson2020; @Datta2017;
+@Gustafsson2003]. While aqueous speciation of tungstate W(VI) is
+complicated and geochemical properties of polymer species seem to vary
+from those of monomeric tungstate [@Davantes2017; @Bednar2006;
+@Clausen2011; @Petruzzell2021; @Hur2016], recent studies have concluded
+the fundamental controls on tungsten speciation include pH,
+concentration of tungsten, and presence of other solutes such as silica
+and phosphorus [@Wasylenki2020; @Bostick2018; @Hobson2020; @Datta2017;
+@Johannesson2013; @Bednar2006]. The monomeric tungstate species
+(WO~4~^2-^) observed at low concentrations and high pH (\>8 pH) appear
+stable and dominate in solution while polymeric tungstate species
+observed at high concentrations and low pH (\<5 pH) appear to dominate
+solution [@Bostick2018; @Johannesson2013].
+
+## Knowledge Gaps
+
+Previous reviewed literature from the past two decades has progressed
+our knowledge on the controls of tungsten mobility significantly however
+the question of applicability of these results to natural field settings
+remains a challenge . Tungsten concentrations reported for non-polluted
+soils in the U.S range from 0.5 to 5.0 mg/kg, from 0.01 to 0.05 µg/L in
+non-polluted stream waters, and from 100 to 200 mg/kg in soils
+surrounding tungsten ore-processing plants [@Kabata-Pendias2007].
+Concentrations in the majority of these experiments are 1 to 3 orders or
+magnitude higher than what would be typically observed in a field
+setting for non-polluted soils and 8 orders of magnitude higher for
+surficial water (1420 mg/kg [@Clausen2009a], 515 mg/L & 700 mg/kg
+[@Strigul2005], 7080 mg/kg [@Bednar2009], 50 mg/kg [@Johannesson2013]).
+Simple experiments to determine the aqueous speciation and sorption
+affinities of tungsten in a laboratory at field relative tungsten
+concentrations so far do not address the effects of continual water flow
+or other variability introduced in natural environmental settings
+[@Wasylenki2020]. Field testing completed at munitions testing
+facilities are not only representative of extreme examples of
+concentrated contamination in soils (up to 5100 mg/kg [W]) but also only
+represent one anthropogenic source of tungsten contamination
+[@Clausen2011; @Bednar2009; @Bostick2018]. Methods and procedures for
+the collection, preparation, and analysis of tungsten in the environment
+are still under development by U.S federal regulatory agencies
+[@EPAUnitedStatesEnvironmentalProtectionAgency2017]. As such, the
+effectiveness and reproducibility of results from various laboratory
+testing procedures is another challenge. Tungsten can be measured using
+ICP-MS, and multiple studies utilize modified EPA acid digestion methods
+to extract bulk concentrations of tungsten from soil and water
+[@Wilson2009; @Hobson2020; @Clausen2007; @Zimmerman2010; @Bednar2009;
+@Cutler2011; @Dold2003; @Assam2007; @JosephTaggart; @Cao2020; @Li2019;
+@Wenzel2001; @Gomez-Alvarez2015; @Violante2010; @Tessier1979]. In
+addition to the variations of acid digestions for bulk extraction, many
+studies include variations of sequential extraction procedures (SEP)
+which aim to test the controls of W mobility using the relationship
+between mobility and W fractionation [@Bostick2018; @Hobson2020;
+@Zimmerman2010; @Cutler2011; @JosephTaggart; @Li2019; @Wenzel2001;
+@Tessier1979; @Gaudino2007; @Kalyvas2018; @Petruzzelli2017;
+@GomezAriza2000; @Bednar2010]. Most SEPs follow a similar fractionation
+order generally cited from Tessier et al. (1979) beginning with
+exchangeable, then carbonate bound, followed by manganese and iron oxide
+bound, organic matter, and finally residual. However, many studies
+publish drastically different and often conflicting results even when
+utilizing the same SEP [@Li2019; @Cao2020; @GomezAriza2000; @Alan2019;
+@Hall1988; @Claff2010; @Violante2010; @Miller1986; @Mesko2013].
+
+## Dataset
+
+The commonalities between the Boriana and Black Pearl mines make them
+comparable study sites and will potentially yield corroborating results.
+Both the Boriana and Black Pearl mines operated c. 1914-1956 with a
+majority of mining operations occurring below ground and milling and
+processing operations above ground. These mines produced ore with an
+average recovery percentage of wolframite (WO~3~) at 70.0% [@Dale1961;
+@Mines1991; @Stein1990]. At present, mine waste and tailings piles are
+barren and exposed with no coverings or repository closure methods in
+place. Both mine localities are characterized as semi-arid regions
+averaging less than 17 inches of precipitation annually and include
+ephemeral streams as drainage channels that discharge into the
+intermittent streams of Mackenzie Creek (Boriana) and Boulder Creek
+(Black Pearl). I hypothesize these drainage channels act as preferential
+pathways for tungsten and other heavy metal contaminants to mobilize in
+the dissolved phase via surface runoff and precipitation events to
+downgradient streams and surrounding watersheds. Surficial soil and
+water samples were collected in October 2021 and March 2022 (Maps 1 & 2)
+from the Black Pearl and Boriana Mines and pseudo bulk soil analysis was
+completed on a subset of soil samples from the Black Pearl Mine using an
+inductively coupled mass spectrometer (ICP-MS) in April and June 2022.
+The dataset used for visualization in this report comprises of a subset
+of these samples.
+
+```{r BPMSampleMap, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Map 1. Sample location map of the Black Pearl Mine.", out.width= "100%"}
+
+BPM_SampleMap
+```
+
+```{r BMSampleMap, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Map 2. Sample location map of the Boriana Mine.", out.width= "100%"}
+
+BM_SampleMap
+```
+
+## Methodology
+
+Fieldwork and Sample Collection Fieldwork consists of the collection of
+surficial soil samples at the Boriana and Black Pearl Mines from the
+source points (tailings and waste piles), upgradient from source points,
+downgradient from the source points within the drainage channels at
+20-25m intervals to the intermittent streams of Boulder and Mackenzie
+Creek, in the intermittent streams of Boulder and Mackenzie Creek above,
+between, and below the entry points of drainage channels, and
+downgradient from source points outside the drainage channels. Water
+samples and water quality measurements using a YSI multi-parameter probe
+will be collected from Boulder and Mackenzie Creek above, between, and
+below the entry points of drainage channels. Soil samples are collected
+in air-tight plastic bags while water samples are collected in 15mL
+plastic centrifuge tubes and stored in a cool dark place. To prevent
+cross contamination in the field, sample gloves are switched out between
+each sample. Following field collection, grain size analysis is done on
+the soil samples using plastic #40 and #200 sieves to determine if there
+is a relationship between grain size and W adsorption during transport.
+
+Laboratory Analysis Laboratory work includes pseudo bulk concentration
+analysis via acid digestion according to modified US EPA Method 3050b as
+described in Bednar et al. [@Bednar2010; @Bednar2009] and the SEP
+described in Hobson et al. [@Hobson2020]. To complete pseudo bulk
+analysis, soil samples will be digested in concentrated nitric and
+phosphoric acid with heat and then in hydrogen peroxide to leach
+secondary precipitates deposited on the sediment grains during runoff,
+filtered through 0.2µm polypropylene syringe filters, dried, then
+dissolved in 2% nitric and trace hydrofluoric acid (HF), diluted, and
+analyzed using an Inductively Coupled Plasma Mass Spectrometer (ICP-MS)
+to determine W, Fe, and Mn concentrations. In conjunction with W, Fe,
+Mn, Ni, Cu, Zn, Mo, Pb, and U may also be analyzed in select samples to
+determine any correlations between other heavy metals and W adsorption
+from these mine tailings. Water samples are filtered (same filters as
+soil samples), diluted with 2% nitric acid and trace HF, and analyzed
+using on the ICP-MS for W, Fe, and Mn concentrations. Bulk soil
+concentrations are extracted using the following calculation.
+$$\frac{MetalAmount(ng)}{BulkSoil(g)} = ICP-MS(ppb) * \frac{QuadSample}{D1SampleAliquot} * \frac{Digested Sample}{Bulk Sample} $$
+
+## Data Analysis
+### Correlation of heavy metal concentrations and spatial visualization
+Using the results from the April and June 2022 ICP-MS run, we can see some metals correlate with each other better than others. Figure one shows that when we compare W concentrations with all other heavy metals, Mo and Fe have decent correlation coefficients while U and Cu don't seem to be correlated with W at all. Similarly, looking at heavy metals as a function of Fe and Mn concentrations (Figures 2 and 3) we see stronger correlations between Fe and Mo, and Mn and Zn compared to any other metals. We can also visualize this data spatially at the Black Pearl Mine in Maps 3, 4, and 5.
+```{r BPM Wplots, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Figure 1. Concentration plots of W vs all other heavy metals at Black Pearl Mine.", out.width= "100%"}
+WPlot
+```
+
+```{r BPM Feplots, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Figure 2. Concentration plots of Fe vs all other heavy metals at Black Pearl Mine.", out.width= "100%"}
+FePlot
+```
+
+```{r BPM Mnplots, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Figure 3. Concentration plots of Mn vs all other heavy metals at Black Pearl Mine.", out.width= "100%"}
+MnPlot
+```
+
+```{r BPMConcmaps, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Map 3. Heavy metal concentrations at the Black Pearl Mine.", out.width= "100%"}
+BPM_HeavyMetalMap
+```
+
+```{r BPM Fe Ratio maps, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Map 4. Ratio of heavy metals to Fe concentrations at the Black Pearl Mine.", out.width= "100%"}
+BPM_FeMetalRatioMap
+```
+
+```{r BPM Mn Ratio maps, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Map 5. Ratio of heavy metals to Mn concentrations at the Black Pearl Mine.", out.width= "100%"}
+BPM_MnMetalRatioMap
+```
+
+### Principal Component Analysis- Black Pearl Mine Soil Samples
+Finally, we can statistically compute these relationships using principal component analysis (PCA). In figure 4, we can see there is a clear and positively correlated relationship between Fe, W, and Mo and they have the strongest effect on PC1 while Mn is inversely correlated and strongly effects PC1. I also feel confident interpreting from the PCA that Pb, Cu, and U are correlated with a stronger effect on PC2. There also seems to be some minor correlation with Zn and Mn which we also observe in Figure 3. 
+
+```{r BPM PCA, echo= FALSE, message= FALSE, warning= FALSE, fig.cap= "Figure 4. PCA of soil concentrations at the Black Pearl Mine.", out.width= "100%"}
+PCAPlot
+```
+
+
+## Conclusion
+Thus far, I think the results I have trend with what we expect to see geochemically at the Black Pearl Mine. While there are huge amounts of error in this dataset, the largest source being my own initial laboratory work, I have made tremendous progress developing my laboratory procedures the past few months that should significantly cut down on that error. After I have more completed laboratory testing on more samples however, I believe PCA as well as the spatial visualization will be extremely useful tools for my research. 
+
+## References
